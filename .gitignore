@@ -1,0 +1,17 @@
+# Build artifacts
+*.fap
+*.elf
+*.o
+*.d
+build/
+dist/
+.extapps/
+
+# ufbt / fbt
+.ufbt/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

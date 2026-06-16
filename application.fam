@@ -1,0 +1,11 @@
+App(
+    appid="dual_em4100_tool",
+    name="Dual EM4100 Tool",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="dual_em4100_tool_app",
+    requires=["gui", "dialogs", "storage", "notification"],
+    stack_size=4 * 1024,
+    fap_category="RFID",
+    fap_description="Read, save and emulate dual-frame (128-bit, MAXBLOCK=4) EM4100 access cards that standard tools only half-copy. Also handles ordinary single-frame EM4100.",
+    fap_version="2.0",
+)
