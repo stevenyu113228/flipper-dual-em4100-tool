@@ -2,9 +2,12 @@
 
 A [Flipper Zero](https://flipperzero.one/) application to **read, save and emulate dual-frame (128-bit) EM4100 access cards** — the kind that standard tools only ever copy *half* of.
 
+[![download](https://img.shields.io/badge/download-latest%20.fap-brightgreen)](../../releases/latest)
 ![category](https://img.shields.io/badge/category-RFID-orange)
 ![platform](https://img.shields.io/badge/platform-Flipper%20Zero-black)
 ![license](https://img.shields.io/badge/license-MIT-blue)
+
+> **No build tools?** Just grab the prebuilt app from [**Releases**](../../releases/latest) and drop it in `apps/RFID/` on your SD card.
 
 ---
 
@@ -35,15 +38,17 @@ This tool fixes that. It captures the raw LF waveform itself, decodes the **full
 
 ## Installation
 
-### Option A — download a prebuilt `.fap`
+### Option A — download a prebuilt `.fap` (easiest)
 
-Grab `dual_em4100_tool.fap` from the [Releases](../../releases) page and copy it to your Flipper:
+**👉 Grab the latest `dual_em4100_tool.fap` from [Releases](../../releases/latest)** — no build tools needed.
+
+Copy it to your Flipper:
 
 ```
 SD Card / apps / RFID / dual_em4100_tool.fap
 ```
 
-(Use [qFlipper](https://flipperzero.one/update)'s File Manager, or copy directly to the microSD card.)
+(Use [qFlipper](https://flipperzero.one/update)'s File Manager, or copy directly to the microSD card.) Then open **Apps → RFID → Dual EM4100 Tool**.
 
 ### Option B — build it yourself
 
