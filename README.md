@@ -35,6 +35,7 @@ This tool fixes that. It captures the raw LF waveform itself, decodes the **full
 - **Save / rename / delete** cards to SD card in a simple text format.
 - **Add manually** — type in `frame1` + `frame2` by hand (hex keypad) without a physical card.
 - **Emulate** the full 128-bit signal via the LF antenna. Single-frame cards are emulated as standard EM4100.
+- **Write to a blank T5577** — clone the card onto a physical tag, then read it back to verify.
 
 ## Installation
 
@@ -69,15 +70,18 @@ Open **Apps → RFID → Dual EM4100 Tool**.
 
 ### Manage saved cards
 
-**Saved cards →** pick a card to open its detail screen:
+**Saved cards →** pick a card to open its detail menu:
 
-| Button | Action |
-|--------|--------|
-| **←** (Left)  | Delete |
-| **OK** (Center) | Emulate |
-| **→** (Right) | Rename |
+- **Emulate** — broadcast the card over the LF antenna (press **Back** to stop).
+- **Write to T5577** — clone the card onto a blank T5577 tag held against the
+  back of the Flipper. The write is verified by reading it back.
+- **Rename**
+- **Delete**
 
-While emulating, press **Back** to stop.
+> **Writing tip:** cloning a dual-frame (5-block) card from a Flipper depends on
+> good antenna coupling. Hold the blank card flat and still against the back; if
+> the write reports a mismatch, reposition and try again (a couple of retries is
+> normal). For a guaranteed write, use a Proxmark3.
 
 ### Add a card manually
 

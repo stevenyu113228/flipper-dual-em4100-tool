@@ -31,6 +31,7 @@
 #include <notification/notification_messages.h>
 #include <toolbox/manchester_decoder.h>
 #include <toolbox/path.h>
+#include <lfrfid/tools/t5577.h>
 
 #define TAG "DualEM4100Tool"
 
@@ -100,6 +101,7 @@ typedef struct {
 
     // Read worker
     FuriThread* read_thread;
+    FuriTimer* read_timer;
     FuriStreamBuffer* capture_stream;
     volatile bool read_running;
     volatile bool read_found;
@@ -113,6 +115,12 @@ typedef struct {
     FuriStreamBuffer* em_stream;
     bool emulating;
 
+    // T5577 write worker
+    FuriThread* write_thread;
+    FuriTimer* write_timer;
+    volatile bool write_running;
+    volatile int write_result; // -1 in progress, 0 ok, 1 mismatch, 2 no read
+
     // Inputs
     DePendingInput pending;
     char name_buf[DE_NAME_LEN];
@@ -120,6 +128,7 @@ typedef struct {
     FuriString* loaded_path; // path of the saved card currently open in detail
 
     DeViewId current_view; // tracked so Back knows where to return
+    bool submenu_is_detail; // false = main menu, true = card-detail menu
     char id_text[24];
 } DeApp;
 
@@ -127,6 +136,20 @@ typedef struct {
     uint32_t pulse;
     uint32_t period;
 } DeCaptureEvent;
+
+// ---- Forward declarations & shared navigation helper ------------------------
+
+static void de_show_menu(DeApp* app);
+static void de_show_read_result(DeApp* app);
+static void de_show_card_detail(DeApp* app);
+static void de_start_read(DeApp* app);
+static void de_text_input_done(void* context);
+
+// Switch view and remember it so the Back handler knows where to return.
+static void de_switch(DeApp* app, DeViewId view) {
+    app->current_view = view;
+    view_dispatcher_switch_to_view(app->view_dispatcher, view);
+}
 
 // ============================================================================
 // EM4100 frame helpers
@@ -240,8 +263,21 @@ static bool de_decoder_feed(
     return found;
 }
 
-static int32_t de_read_thread(void* ctx) {
-    DeApp* app = ctx;
+// Energise the field, capture and decode until a card is confirmed (the same
+// result seen DE_READ_VALIDATE times) or timeout_ms elapses. Returns true and
+// fills out_f1/out_f2/out_segs on success. Used by both the reader and the
+// post-write verifier. `running` lets the caller abort (NULL = run to timeout).
+static bool de_capture_decode(
+    DeApp* app,
+    uint32_t timeout_ms,
+    volatile bool* running,
+    uint64_t* out_f1,
+    uint64_t* out_f2,
+    uint8_t* out_segs) {
+    if(app->capture_stream) furi_stream_buffer_free(app->capture_stream);
+    app->capture_stream =
+        furi_stream_buffer_alloc(sizeof(DeCaptureEvent) * 64, sizeof(DeCaptureEvent));
+
     app->isr_have_pulse = false;
     furi_hal_rfid_tim_read_start(125000.0f, 0.5f);
     furi_delay_ms(1500);
@@ -252,19 +288,20 @@ static int32_t de_read_thread(void* ctx) {
     uint64_t last_f1 = 0, last_f2 = 0;
     uint8_t last_segs = 0, streak = 0;
     uint32_t start = furi_get_tick();
+    bool found = false;
 
     DeCaptureEvent ev;
-    while(app->read_running) {
+    while(running == NULL || *running) {
         if(furi_stream_buffer_receive(app->capture_stream, &ev, sizeof(ev), 50) == sizeof(ev)) {
             uint64_t f1, f2;
             uint8_t segs;
             if(de_decoder_feed(&dec, ev.pulse, ev.period, &f1, &f2, &segs)) {
                 if(f1 == last_f1 && f2 == last_f2 && segs == last_segs) {
                     if(++streak >= DE_READ_VALIDATE) {
-                        app->frame1 = f1;
-                        app->frame2 = f2;
-                        app->segments = segs;
-                        app->read_found = true;
+                        *out_f1 = f1;
+                        *out_f2 = f2;
+                        *out_segs = segs;
+                        found = true;
                         break;
                     }
                 } else {
@@ -275,11 +312,27 @@ static int32_t de_read_thread(void* ctx) {
                 }
             }
         }
-        if(furi_get_tick() - start > DE_READ_TIMEOUT_MS) break;
+        if(furi_get_tick() - start > timeout_ms) break;
     }
 
     furi_hal_rfid_tim_read_capture_stop();
     furi_hal_rfid_tim_read_stop();
+    return found;
+}
+
+static int32_t de_read_thread(void* ctx) {
+    DeApp* app = ctx;
+    uint64_t f1, f2;
+    uint8_t segs;
+    if(de_capture_decode(app, DE_READ_TIMEOUT_MS, &app->read_running, &f1, &f2, &segs)) {
+        app->frame1 = f1;
+        app->frame2 = f2;
+        app->segments = segs;
+        // Publish the data before the read_found flag the UI timer polls, so the
+        // timer never observes read_found==true with stale frame fields.
+        __DMB();
+        app->read_found = true;
+    }
     return 0;
 }
 
@@ -354,6 +407,125 @@ static void de_emulate_stop(DeApp* app) {
     if(!app->emulating) return;
     furi_hal_rfid_tim_emulate_dma_stop();
     app->emulating = false;
+}
+
+// ============================================================================
+// Write to a blank T5577 card (+ read-back verify)
+// ============================================================================
+
+// Config word for dual-frame cards. The reference card's own T5577 dump uses
+// 0x00148C82 (Manchester | RF/64 | MAXBLOCK=4, plus a few low bits the issuer
+// set). We replicate it verbatim so the cloned card is bit-identical to the
+// original, maximising reader compatibility. The standard value 0x00148080
+// (no extra low bits) also works for plain Manchester EM4100.
+#define DE_DUAL_CONFIG 0x00148C82UL
+
+// Fill the T5577 block layout. Dual-frame -> MAXBLOCK=4 / 5 blocks; single-frame
+// -> standard EM4100 MAXBLOCK=2 / 3 blocks.
+static void de_fill_t5577(DeApp* app, LFRFIDT5577* tag) {
+    if(app->segments == 2) {
+        tag->block[0] = DE_DUAL_CONFIG;
+        tag->block[1] = app->frame1 >> 32;
+        tag->block[2] = app->frame1 & 0xFFFFFFFF;
+        tag->block[3] = app->frame2 >> 32;
+        tag->block[4] = app->frame2 & 0xFFFFFFFF;
+        tag->blocks_to_write = 5;
+    } else {
+        tag->block[0] = LFRFID_T5577_MODULATION_MANCHESTER | LFRFID_T5577_BITRATE_RF_64 |
+                        (2 << LFRFID_T5577_MAXBLOCK_SHIFT);
+        tag->block[1] = app->frame1 >> 32;
+        tag->block[2] = app->frame1 & 0xFFFFFFFF;
+        tag->blocks_to_write = 3;
+    }
+    tag->mask = 0;
+}
+
+static int32_t de_write_thread(void* ctx) {
+    DeApp* app = ctx;
+
+    // Let the RF hardware settle before the bit-banged write. The built-in
+    // writer does the same `furi_delay_ms(5)` "halt" before every t5577_write();
+    // without it the field/timer left over from stopping emulation corrupts the
+    // microsecond write timing (0 bits get written as 1, blocks come out wrong).
+    furi_delay_ms(5);
+
+    // 1. Write the blank card (blocking ~150ms, manages the RF field itself).
+    LFRFIDT5577 tag = {0};
+    de_fill_t5577(app, &tag);
+    t5577_write(&tag);
+
+    // 2. Read it back and compare (reuses the reader's capture+decode).
+    uint64_t f1 = 0, f2 = 0;
+    uint8_t segs = 0;
+    bool got = de_capture_decode(app, 2000, &app->write_running, &f1, &f2, &segs);
+    if(!got) {
+        app->write_result = 2; // no read
+    } else if(f1 == app->frame1 && segs == app->segments && (segs == 1 || f2 == app->frame2)) {
+        app->write_result = 0; // success
+    } else {
+        app->write_result = 1; // mismatch
+    }
+    return 0;
+}
+
+static void de_write_finish(DeApp* app) {
+    app->write_running = false;
+    if(app->write_thread) {
+        furi_thread_join(app->write_thread);
+        furi_thread_free(app->write_thread);
+        app->write_thread = NULL;
+    }
+}
+
+static void de_write_timer_cb(void* context) {
+    DeApp* app = context;
+    // Nothing to poll (thread already reaped) -> stop and bail.
+    if(!app->write_thread) {
+        if(app->write_timer) furi_timer_stop(app->write_timer);
+        return;
+    }
+    if(furi_thread_get_state(app->write_thread) != FuriThreadStateStopped) {
+        return; // still writing/verifying
+    }
+    // worker done
+    furi_timer_stop(app->write_timer);
+    de_write_finish(app);
+
+    popup_reset(app->popup);
+    if(app->write_result == 0) {
+        notification_message(app->notifications, &sequence_success);
+        notification_message(app->notifications, &sequence_single_vibro);
+        popup_set_header(app->popup, "Write OK!", 64, 18, AlignCenter, AlignTop);
+        popup_set_text(app->popup, "Card written and\nverified.", 64, 34, AlignCenter, AlignTop);
+    } else {
+        notification_message(app->notifications, &sequence_error);
+        popup_set_header(app->popup, "Write failed", 64, 18, AlignCenter, AlignTop);
+        popup_set_text(
+            app->popup,
+            app->write_result == 2 ? "No card read back.\nReposition & retry." :
+                                     "Data mismatch.\nReposition & retry.",
+            64,
+            34,
+            AlignCenter,
+            AlignTop);
+    }
+    de_switch(app, DeViewPopup);
+}
+
+static void de_start_write(DeApp* app) {
+    de_emulate_stop(app); // mutual exclusion: free the RF/timer
+    app->write_running = true;
+    app->write_result = -1;
+    app->write_thread = furi_thread_alloc_ex("DeWrite", 2048, de_write_thread, app);
+    furi_thread_start(app->write_thread);
+
+    popup_reset(app->popup);
+    popup_set_header(app->popup, "Writing T5577...", 64, 18, AlignCenter, AlignTop);
+    popup_set_text(
+        app->popup, "Hold a blank T5577\non the back", 64, 34, AlignCenter, AlignTop);
+    de_switch(app, DeViewPopup);
+
+    furi_timer_start(app->write_timer, furi_ms_to_ticks(150));
 }
 
 // ============================================================================
@@ -434,22 +606,6 @@ static bool de_load(DeApp* app, const char* path) {
     return ok;
 }
 
-// ============================================================================
-// Navigation helpers (defined after scene builders below)
-// ============================================================================
-
-static void de_show_menu(DeApp* app);
-static void de_show_read_result(DeApp* app);
-static void de_show_card_detail(DeApp* app);
-static void de_start_read(DeApp* app);
-static void de_text_input_done(void* context);
-
-// Switch view and remember it so the Back handler knows where to return.
-static void de_switch(DeApp* app, DeViewId view) {
-    app->current_view = view;
-    view_dispatcher_switch_to_view(app->view_dispatcher, view);
-}
-
 // ---- Submenu (main menu) ----------------------------------------------------
 
 static void de_submenu_cb(void* context, uint32_t index) {
@@ -496,6 +652,7 @@ static void de_submenu_cb(void* context, uint32_t index) {
 }
 
 static void de_show_menu(DeApp* app) {
+    app->submenu_is_detail = false;
     submenu_reset(app->submenu);
     submenu_set_header(app->submenu, "Dual EM4100 Tool");
     submenu_add_item(app->submenu, "Read card", DeMenuRead, de_submenu_cb, app);
@@ -518,12 +675,10 @@ static void de_read_finish(DeApp* app) {
 
 // popup "Reading..." needs to poll the worker; we use a periodic timer via the
 // popup callback is not enough, so we drive it from a FuriTimer.
-static FuriTimer* de_read_timer = NULL;
-
 static void de_read_timer_cb(void* context) {
     DeApp* app = context;
     if(app->read_found) {
-        furi_timer_stop(de_read_timer);
+        furi_timer_stop(app->read_timer);
         de_read_finish(app);
         notification_message(app->notifications, &sequence_success);
         notification_message(app->notifications, &sequence_single_vibro);
@@ -532,7 +687,7 @@ static void de_read_timer_cb(void* context) {
     } else if(app->read_thread &&
               furi_thread_get_state(app->read_thread) == FuriThreadStateStopped) {
         // worker exited without a find -> timeout
-        furi_timer_stop(de_read_timer);
+        furi_timer_stop(app->read_timer);
         de_read_finish(app);
         popup_reset(app->popup);
         popup_set_header(app->popup, "No card found", 64, 18, AlignCenter, AlignTop);
@@ -543,9 +698,7 @@ static void de_read_timer_cb(void* context) {
 }
 
 static void de_start_read(DeApp* app) {
-    if(app->capture_stream) furi_stream_buffer_free(app->capture_stream);
-    app->capture_stream =
-        furi_stream_buffer_alloc(sizeof(DeCaptureEvent) * 64, sizeof(DeCaptureEvent));
+    // capture stream is (re)allocated inside de_capture_decode
     app->read_running = true;
     app->read_found = false;
     app->read_thread = furi_thread_alloc_ex("DeRead", 2048, de_read_thread, app);
@@ -557,10 +710,7 @@ static void de_start_read(DeApp* app) {
         app->popup, "Hold card on the\nback of the Flipper", 64, 34, AlignCenter, AlignTop);
     de_switch(app, DeViewPopup);
 
-    if(!de_read_timer) {
-        de_read_timer = furi_timer_alloc(de_read_timer_cb, FuriTimerTypePeriodic, app);
-    }
-    furi_timer_start(de_read_timer, furi_ms_to_ticks(100));
+    furi_timer_start(app->read_timer, furi_ms_to_ticks(100));
 }
 
 // Build the read-result / card-detail widget. dual frame shown in full.
@@ -633,51 +783,58 @@ static void de_show_read_result(DeApp* app) {
 }
 
 // ============================================================================
-// Card-detail screen: Emulate / Rename / Delete
+// Card-detail screen: a submenu (Emulate / Write to T5577 / Rename / Delete)
 // ============================================================================
 
-static void de_btn_emulate_cb(GuiButtonType t, InputType in, void* ctx) {
-    UNUSED(t);
-    DeApp* app = ctx;
-    if(in != InputTypeShort) return;
-    de_emulate_start(app);
-    popup_reset(app->popup);
-    popup_set_header(app->popup, "Emulating", 64, 18, AlignCenter, AlignTop);
-    popup_set_text(app->popup, app->id_text, 64, 38, AlignCenter, AlignTop);
-    de_switch(app, DeViewPopup);
-}
+typedef enum {
+    DeDetailEmulate,
+    DeDetailWrite,
+    DeDetailRename,
+    DeDetailDelete,
+} DeDetailId;
 
-static void de_btn_rename_cb(GuiButtonType t, InputType in, void* ctx) {
-    UNUSED(t);
-    DeApp* app = ctx;
-    if(in != InputTypeShort) return;
-    // prefill with current filename (without extension)
-    FuriString* fname = furi_string_alloc();
-    path_extract_filename(app->loaded_path, fname, true);
-    strncpy(app->name_buf, furi_string_get_cstr(fname), DE_NAME_LEN - 1);
-    app->name_buf[DE_NAME_LEN - 1] = 0;
-    furi_string_free(fname);
-    app->pending = DeInputRename;
-    text_input_set_header_text(app->text_input, "Rename card");
-    text_input_set_result_callback(
-        app->text_input, de_text_input_done, app, app->name_buf, DE_NAME_LEN, false);
-    de_switch(app, DeViewTextInput);
-}
-
-static void de_btn_delete_cb(GuiButtonType t, InputType in, void* ctx) {
-    UNUSED(t);
-    DeApp* app = ctx;
-    if(in != InputTypeShort) return;
-    storage_simply_remove(app->storage, furi_string_get_cstr(app->loaded_path));
-    de_show_menu(app);
+static void de_detail_submenu_cb(void* context, uint32_t index) {
+    DeApp* app = context;
+    switch(index) {
+    case DeDetailEmulate:
+        de_emulate_start(app);
+        popup_reset(app->popup);
+        popup_set_header(app->popup, "Emulating", 64, 18, AlignCenter, AlignTop);
+        popup_set_text(app->popup, app->id_text, 64, 38, AlignCenter, AlignTop);
+        de_switch(app, DeViewPopup);
+        break;
+    case DeDetailWrite:
+        de_start_write(app);
+        break;
+    case DeDetailRename: {
+        FuriString* fname = furi_string_alloc();
+        path_extract_filename(app->loaded_path, fname, true);
+        strncpy(app->name_buf, furi_string_get_cstr(fname), DE_NAME_LEN - 1);
+        app->name_buf[DE_NAME_LEN - 1] = 0;
+        furi_string_free(fname);
+        app->pending = DeInputRename;
+        text_input_set_header_text(app->text_input, "Rename card");
+        text_input_set_result_callback(
+            app->text_input, de_text_input_done, app, app->name_buf, DE_NAME_LEN, false);
+        de_switch(app, DeViewTextInput);
+        break;
+    }
+    case DeDetailDelete:
+        storage_simply_remove(app->storage, furi_string_get_cstr(app->loaded_path));
+        de_show_menu(app);
+        break;
+    }
 }
 
 static void de_show_card_detail(DeApp* app) {
-    de_fill_card_widget(app, false);
-    widget_add_button_element(app->widget, GuiButtonTypeLeft, "Delete", de_btn_delete_cb, app);
-    widget_add_button_element(app->widget, GuiButtonTypeCenter, "Emulate", de_btn_emulate_cb, app);
-    widget_add_button_element(app->widget, GuiButtonTypeRight, "Rename", de_btn_rename_cb, app);
-    de_switch(app, DeViewWidget);
+    app->submenu_is_detail = true;
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, app->id_text); // ID as header
+    submenu_add_item(app->submenu, "Emulate", DeDetailEmulate, de_detail_submenu_cb, app);
+    submenu_add_item(app->submenu, "Write to T5577", DeDetailWrite, de_detail_submenu_cb, app);
+    submenu_add_item(app->submenu, "Rename", DeDetailRename, de_detail_submenu_cb, app);
+    submenu_add_item(app->submenu, "Delete", DeDetailDelete, de_detail_submenu_cb, app);
+    de_switch(app, DeViewSubmenu);
 }
 
 // ============================================================================
@@ -690,13 +847,20 @@ static void de_text_input_done(void* context) {
         de_save_as(app, app->name_buf);
         de_show_menu(app);
     } else if(app->pending == DeInputRename) {
-        // write new file, remove old
+        // rename the file, then keep the loaded_path pointing at the new name
+        // and return to the card's detail menu (so the user stays on the card).
         FuriString* newp = furi_string_alloc();
         de_card_path(app, app->name_buf, newp);
-        storage_common_rename(
-            app->storage, furi_string_get_cstr(app->loaded_path), furi_string_get_cstr(newp));
+        if(storage_common_rename(
+               app->storage,
+               furi_string_get_cstr(app->loaded_path),
+               furi_string_get_cstr(newp)) == FSE_OK) {
+            furi_string_set(app->loaded_path, newp);
+        }
         furi_string_free(newp);
-        de_show_menu(app);
+        app->pending = DeInputNone;
+        de_show_card_detail(app);
+        return;
     }
     app->pending = DeInputNone;
 }
@@ -722,15 +886,43 @@ static void de_byte_input_done(void* context) {
 static bool de_back_cb(void* context) {
     DeApp* app = context;
 
-    // Active operations first: stop and return to menu.
+    // A write in progress must not be interrupted: t5577_write() blocks inside a
+    // critical section and joining it here would freeze the UI. Swallow Back and
+    // let the write finish; the timer callback shows the result.
+    if(app->write_running) {
+        return true;
+    }
+
+    // Active operations: stop and return to menu.
     if(app->emulating) {
         de_emulate_stop(app);
         de_show_menu(app);
         return true;
     }
     if(app->read_running) {
-        if(de_read_timer) furi_timer_stop(de_read_timer);
+        furi_timer_stop(app->read_timer);
         de_read_finish(app);
+        de_show_menu(app);
+        return true;
+    }
+
+    // Cancelling a text input: return to where the input was launched from,
+    // so the user doesn't lose a just-read card or fall out of the detail menu.
+    if(app->current_view == DeViewTextInput) {
+        DePendingInput was = app->pending;
+        app->pending = DeInputNone;
+        if(was == DeInputSaveName) {
+            de_show_read_result(app); // keep the read card, let them retry Save
+            return true;
+        }
+        if(was == DeInputRename) {
+            de_show_card_detail(app); // back to the card's detail menu
+            return true;
+        }
+    }
+
+    // Card-detail submenu -> back to main menu (not exit).
+    if(app->current_view == DeViewSubmenu && app->submenu_is_detail) {
         de_show_menu(app);
         return true;
     }
@@ -738,7 +930,7 @@ static bool de_back_cb(void* context) {
     // On the main menu -> let the dispatcher exit the app.
     if(app->current_view == DeViewSubmenu) return false;
 
-    // Any other screen (read result, card detail, about, popup, inputs) -> menu.
+    // Any other screen (read result, about, popup) -> menu.
     app->pending = DeInputNone;
     de_show_menu(app);
     return true;
@@ -773,6 +965,8 @@ int32_t dual_em4100_tool_app(void* p) {
     app->widget = widget_alloc();
     app->text_input = text_input_alloc();
     app->byte_input = byte_input_alloc();
+    app->read_timer = furi_timer_alloc(de_read_timer_cb, FuriTimerTypePeriodic, app);
+    app->write_timer = furi_timer_alloc(de_write_timer_cb, FuriTimerTypePeriodic, app);
 
     view_dispatcher_add_view(app->view_dispatcher, DeViewSubmenu, submenu_get_view(app->submenu));
     view_dispatcher_add_view(app->view_dispatcher, DeViewPopup, popup_get_view(app->popup));
@@ -791,14 +985,15 @@ int32_t dual_em4100_tool_app(void* p) {
     de_show_menu(app);
     view_dispatcher_run(app->view_dispatcher);
 
-    // Cleanup
-    if(de_read_timer) {
-        furi_timer_stop(de_read_timer);
-        furi_timer_free(de_read_timer);
-        de_read_timer = NULL;
-    }
+    // Cleanup. Stop timers first (so no callback fires mid-teardown), then reap
+    // worker threads, then free everything.
+    furi_timer_stop(app->read_timer);
+    furi_timer_stop(app->write_timer);
     de_read_finish(app);
+    de_write_finish(app);
     de_emulate_stop(app);
+    furi_timer_free(app->read_timer);
+    furi_timer_free(app->write_timer);
     if(app->capture_stream) furi_stream_buffer_free(app->capture_stream);
 
     view_dispatcher_remove_view(app->view_dispatcher, DeViewSubmenu);
